@@ -1,0 +1,628 @@
+// =====================================================================================
+//  Silver Infrared - Copyright (c) 2026. All rights reserved.
+//  PROPRIETARY SOFTWARE. The tone curves, colour equations, edge colour bleed and the processing logic in this
+//  file are the author's intellectual property. This file is licensed for use only; copying, modifying,
+//  redistributing, reselling, or reusing any part of its equations or code in other products is not permitted
+//  without the author's written permission. Removing or altering this notice is not permitted.
+//  Distribute the encrypted .dctle version of this file, not this readable source.
+// =====================================================================================
+
+// Silver Infrared
+// Infrared-inspired silver monochrome (Giedi Prime look), for DaVinci Intermediate / DaVinci Wide Gamut.
+// Silver Infrared = 0.0 returns the input untouched (exact pass-through; nothing else is applied either).
+//
+// Controls (in order):
+//   Silver Infrared  - overall effect amount
+//   Highlight Roll-Off - highlight-only roll-off control (-1..1; zero effect below upper midtones).
+//                        Positive = existing silver highlight refinement, negative = weaker roll-off
+//   Contrast         - Resolve-style contrast about middle grey (0.9-1.1, 1.0 = bypass), applied to luminance only
+//   Transcript       - Silver (default) or Gold: Gold recolours the silver result as gold-metallic at constant
+//                      luminance
+//   Apply Edge Color Bleed - subtle colour bleed from bright, coloured source edges (colour taken from the input image)
+//   Bleed Checker    - diagnostic view (default OFF): shows only the narrow area where Edge Color Bleed changes the image
+//                      (the difference the bleed stage produces, computed by edge_bleed()); brightness follows the bleed
+//                      intensity (weak = dim, strong = bright), everything else very dark grey. Colours are slightly
+//                      desaturated and the highlight is lightly smoothed. Active only while Apply Edge Color Bleed is ON;
+//                      with it OFF the checkbox has no effect. Switch OFF before rendering.
+//   Texture          - enables the integrated grain (default ON) (algorithm from Grain_v1.dctl, internal Grain Size 0.5)
+//   Show Curve       - draws the tonal response curve over the image (default OFF). A DCTL can only change the
+//                      output pixels, so the line is part of the frame while this is ON - switch it OFF before rendering.
+//   Grain Amount     - grain intensity (0.8-5, default 1.5); used only when Texture is ON
+
+DEFINE_UI_PARAMS(silver, Silver Infrared, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(silverTex, Highlight Roll-Off, DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.001)
+DEFINE_UI_PARAMS(contrastAmt, Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.9, 1.1, 0.001)
+DEFINE_UI_PARAMS(transcript, Transcript, DCTLUI_COMBO_BOX, 0, {TRANSCRIPT_SILVER, TRANSCRIPT_GOLD}, {Silver, Gold})
+DEFINE_UI_PARAMS(cbBleed, Apply Edge Color Bleed, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(cbBleedChecker, Bleed Checker, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(cbTexture, Texture, DCTLUI_CHECK_BOX, 1)
+DEFINE_UI_PARAMS(cbShowCurve, Show Curve, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(grainAmount, Grain Amount, DCTLUI_SLIDER_FLOAT, 1.5, 0.8, 5.0, 0.001)
+
+// ---- DaVinci Intermediate transfer function (official constants) ----
+__DEVICE__ float di_to_lin(float y)
+{
+    return (y <= 0.02740668f) ? (y / 10.44426855f)
+                              : (_exp2f(y / 0.07329248f - 7.0f) - 0.0075f);
+}
+
+__DEVICE__ float lin_to_di(float x)
+{
+    return (x <= 0.00262409f) ? (x * 10.44426855f)
+                              : ((_log2f(x + 0.0075f) + 7.0f) * 0.07329248f);
+}
+
+__DEVICE__ float sstep(float a, float b, float x)
+{
+    float t = _clampf((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float luma709(float3 c) { return c.x * 0.2126f + c.y * 0.7152f + c.z * 0.0722f; }
+
+// ---- Tone curve in DI log space, pivoted on DI middle grey (0.336) ----
+// (unchanged from the previous version)
+__DEVICE__ float silver_curve(float y)
+{
+    const float P  = 0.336f;  // DI middle grey
+    const float GS = 1.40f;   // shadow exponent
+    const float GH = 1.45f;   // midtone / upper-mid slope at pivot
+    const float H  = 0.55f;   // shoulder headroom (asymptote = P + H)
+
+    if (y <= 0.0f) return y;
+    if (y < P)     return P * _powf(y / P, GS);
+
+    // The slope above the pivot used to jump from GS (1.40) to GH (1.45) exactly at middle grey (a kink in the
+    // tone curve, visible in every mode). Over the first W = 0.09 DI above the pivot the slope now eases from GS
+    // to GH with a cubic profile, so slope AND curvature are continuous at the pivot (max change 0.001 DI).
+    const float W = 0.09f;
+    float d = y - P;
+    float s = _fmaxf(0.0f, 1.0f - d / W);
+    float s2 = s * s;
+    float u = GH * d - (GH - GS) * W * 0.25f * (1.0f - s2 * s2);
+    return P + u / _sqrtf(1.0f + (u * u) / (H * H));
+}
+
+// ---- Highlight Roll Off: highlight-only refinement (no spatial filtering) ----
+// Adds a smooth sin^2 lift over the bright tonal window [0.46, 0.80] of the curved signal.
+// Value and slope are exactly zero at both window edges, so everything at or below 0.46
+// (shadows, lower/middle midtones, diffuse-white onset) is untouched and there is no threshold.
+// Inside the window: slightly more separation in the rising half, gentler roll-off in the falling half.
+// Peak lift at slider 1.0 is 0.03 DI (about 0.4 stop); slope stays within [0.72, 1.28] => monotonic, no clipping.
+// Negative slider values apply the same term with reversed sign (linear extension): the rising half
+// gets gentler and the upper half steeper, so bright-tone variation is more visible; still zero below 0.46.
+__DEVICE__ float silver_sheen(float y)
+{
+    const float A  = 0.03f;
+    const float lo = 0.46f;
+    const float hi = 0.80f;
+
+    float v = _clampf((y - lo) / (hi - lo), 0.0f, 1.0f);
+    float s = _sinf(3.14159265f * v);
+    return A * s * s;
+}
+
+// ---- Highlight Roll-Off, NEGATIVE range only (slider < 0) ----
+// The sin^2 window of silver_sheen() has a curvature jump at both edges and, at -1, squeezes a large
+// slope swing into a narrow 0.34 DI window (slope 0.72 -> 1.28). That reads as a hard band / kink when the
+// slider goes negative. This version keeps the same peak (0.03 DI at slider -1, centred near y = 0.66) but spreads it
+// over a wider window [0.40, 0.92] with a quintic bump 64 * (v * (1 - v))^3: value, slope AND curvature are
+// exactly zero at both edges (C2-smooth, no seams), and the slope stays within [0.80, 1.20] at -1 (monotonic).
+// The upper anchor is raised from 0.80 to 0.92 so the effect fades out above the highest reachable tones
+// (nothing happens at or below 0.40, so middle grey 0.336 and the shadows are untouched; no clipping).
+// Used as: y = y + silver_sheen_neg(y) * silverTex  (silverTex < 0).  Positive range still uses silver_sheen().
+__DEVICE__ float silver_sheen_neg(float y)
+{
+    const float A  = 0.03f;
+    const float lo = 0.40f;
+    const float hi = 0.92f;
+
+    float v = _clampf((y - lo) / (hi - lo), 0.0f, 1.0f);
+    float w = v * (1.0f - v);
+    return A * 64.0f * w * w * w;
+}
+
+// ---- Contrast: Resolve-style pivoted contrast in DI log space ----
+// Pivot = DI middle grey (0.336), which the silver curve maps to itself, so midtone balance is kept.
+// Above the pivot : out = pivot + (in - pivot) * contrast   (the classic Resolve operation)
+// Below the pivot : out = pivot * (in / pivot) ^ contrast   (same slope at the pivot, C1-continuous,
+//                   but keeps black at exactly 0, so blacks are neither lifted nor pushed negative)
+// Operates on the neutral luminance signal only, so it cannot introduce colour shifts.
+__DEVICE__ float silver_contrast(float y, float c)
+{
+    const float P = 0.336f;
+    if (y <= 0.0f) return y;
+    if (y < P)     return P * _powf(y / P, c);
+    return P + (y - P) * c;
+}
+
+// ---- Silver / Gold: smooth low-end toe ----
+// Applied to the tone-mapped signal after Highlight Roll-Off and Contrast, so the floor stays put whatever
+// the Contrast slider does. Same job as before - the output at pure black sits at 48/1023 (10-bit 48) and the
+// lift fades out completely by T = 0.24 DI (everything at or above T is returned untouched) - but the shape
+// between black and T is now a single smooth S-shaped toe instead of the previous lift + power-curve mix, which
+// produced a slope plateau around DI 0.08-0.12 followed by a sharp bend near DI 0.2.
+//  - The toe is a polynomial in u, where u is the position along the same shadow power curve that silver_curve()
+//    uses below middle grey: u = (y / P)^(1/GS) * (P / xJ), P = 0.336, GS = 1.40, xJ = 0.2642178 (u = 1 at y = T).
+//    Out = F + u^2 * (d1 + u * (d2 + u * (d3 + u * (d4 + u * (d5 + u * d6))))).
+//  - Black: value exactly F, slope exactly 0 (the S-curve eases in from black, no kink and no flat spot).
+//  - Junction at T: value, slope, curvature and the next derivative all match the untouched curve above, so the
+//    toe merges with no seam. The slope rises monotonically (never reverses) and the curvature falls steadily
+//    from black up to T, so there is a single smooth knee and no secondary bend.
+//  - Below black (y < 0) the toe continues with the same slope-0-at-black behaviour and relaxes to the original
+//    straight continuation (slope 1 - F/T) within about 0.03 DI, so there is no kink at black from below either.
+__DEVICE__ float silver_toe(float y)
+{
+    const float F  = 48.0f / 1023.0f;  // shadow floor (10-bit 48)
+    const float T  = 0.24f;            // toe width in DI
+
+    if (y >= T) return y;
+
+    if (y <= 0.0f)
+    {
+        const float C = 0.80449658f;   // 1 - F / T: original slope below black
+        float yy = y * y;
+        return F + C * y * yy / (yy + 0.0001f);
+    }
+
+    float u = 1.27167803f * _powf(y * (1.0f / 0.336f), 0.71428571f);
+
+    float p = 0.18916144f;
+    p = p * u - 0.65601007f;
+    p = p * u + 0.82026914f;
+    p = p * u - 0.44192391f;
+    p = p * u + 0.05111508f;
+    p = p * u + 0.23046748f;
+    return F + u * u * p;
+}
+
+// ---- Apply Gold: luminance-dependent chroma at constant (Rec.709-weighted) linear luminance ----
+// Returns a linear RGB multiplier whose luma is exactly 1, so tonal structure is unchanged.
+//  - shadows fade to neutral (no coloured noise / yellow overlay), richer deeper gold in lower mids
+//  - highlights become paler, slightly yellower "champagne" gold
+__DEVICE__ float3 gold_tint(float y)
+{
+    float wLo = sstep(0.04f, 0.28f, y);
+    float wHi = sstep(0.50f, 0.78f, y);
+    float k   = 0.40f * wLo * (1.0f - 0.35f * wHi);
+
+    // gold reference colours (linear), deep gold -> pale champagne gold
+    float3 gS = make_float3(1.00f, 0.62f, 0.12f);
+    float3 gH = make_float3(1.00f, 0.78f, 0.26f);
+    float3 g  = make_float3(gS.x + (gH.x - gS.x) * wHi,
+                            gS.y + (gH.y - gS.y) * wHi,
+                            gS.z + (gH.z - gS.z) * wHi);
+
+    float inv = 1.0f / luma709(g);
+    float3 gn = make_float3(g.x * inv, g.y * inv, g.z * inv);
+    return make_float3(1.0f + k * (gn.x - 1.0f),
+                       1.0f + k * (gn.y - 1.0f),
+                       1.0f + k * (gn.z - 1.0f));
+}
+
+// =====================================================================================
+//  Integrated grain  -  algorithm taken unchanged from Grain_v1.dctl
+//  (latent PSD field, tri-lattice gaussian, correlated RGB via Cholesky, exposure/zone weighting).
+//  Fixed at the Grain DCTL's defaults except: internal Grain Size = 0.5 (not exposed),
+//  Saturation 0, Dark Granules 0, Shadows 1.0, Highlights 1.0, Grayscale Ramp off.
+// =====================================================================================
+#define GRAIN_SIZE 0.5f   // internal Grain Size (Grain_v1.dctl default is 1.5)
+
+__CONSTANT__ float EPS         = 1e-6f;
+__CONSTANT__ float PSD_DEFAULT = 0.50f;
+__CONSTANT__ float FINE_DETAIL = 0.35f;
+__CONSTANT__ float AA_OFF      = 0.35f;
+__CONSTANT__ float RGCORR      = 0.55f;
+__CONSTANT__ float RBCORR      = 0.35f;
+__CONSTANT__ float GBCORR      = 0.45f;
+__CONSTANT__ float AMT_GAIN    = 2.0f;
+
+__DEVICE__ inline uint lcg(uint s){ return s*1664525u + 1013904223u; }
+__DEVICE__ inline uint mix32(uint s){
+    s ^= 0x9E3779B9u; s = lcg(s);
+    s ^= 0x85EBCA6Bu; s = lcg(s);
+    s ^= 0xC2B2AE35u; s = lcg(s);
+    return s;
+}
+__DEVICE__ float u01(uint s){ return (float)(s)*2.3283064365386963e-10f; }
+
+__DEVICE__ float gauss_cell(int xi,int yi,int bump,uint frameSalt,uint tag){
+    uint base=(uint)xi*747796405u + (uint)yi*2891336453u + (uint)bump*1597334677u + frameSalt + (tag*0x9E3779B9u);
+    uint s1=mix32(base^0xA5A5A5A5u), s2=mix32(base^0x3C6EF372u);
+    float u1=_fmaxf(u01(s1),1e-7f), u2=u01(s2);
+    float r=_sqrtf(-2.0f*_logf(u1)); float th=6.28318530718f*u2;
+    return r*_cosf(th);
+}
+__DEVICE__ float bilerp_field(float g00,float g10,float g01,float g11,float2 fp){
+    float sx=sstep(0.0f,1.0f,fp.x), sy=sstep(0.0f,1.0f,fp.y);
+    float u=g00+(g10-g00)*sx, v=g01+(g11-g01)*sx;
+    return u+(v-u)*sy;
+}
+__DEVICE__ float gauss2D_lattice(float2 p,int bump,uint frameSalt){
+    float2 ip=make_float2(_floorf(p.x),_floorf(p.y));
+    float2 fp=make_float2(p.x-ip.x,p.y-ip.y);
+    int xi=(int)ip.x, yi=(int)ip.y;
+    float g00=gauss_cell(xi,yi,bump,frameSalt,0u);
+    float g10=gauss_cell(xi+1,yi,bump,frameSalt,1u);
+    float g01=gauss_cell(xi,yi+1,bump,frameSalt,2u);
+    float g11=gauss_cell(xi+1,yi+1,bump,frameSalt,3u);
+    return bilerp_field(g00,g10,g01,g11,fp);
+}
+__DEVICE__ float gauss2D_tri(float2 p,float invSize,uint frameSalt){
+    float2 gp=make_float2(p.x*invSize,p.y*invSize);
+    // rotation angles 0, 0.6435, 1.1370 rad: cos/sin precomputed
+    float v1=gauss2D_lattice(gp, 0, frameSalt);
+    float v2=gauss2D_lattice(make_float2(0.800000668f*gp.x-0.599999070f*gp.y, 0.599999070f*gp.x+0.800000668f*gp.y), 111, frameSalt);
+    float v3=gauss2D_lattice(make_float2(0.420318544f*gp.x-0.907376587f*gp.y, 0.907376587f*gp.x+0.420318544f*gp.y), 257, frameSalt);
+    return (v1+v2+v3)*(1.0f/3.0f);
+}
+
+__DEVICE__ float latent_psd_field(float2 uv,float invSize,uint frameSalt,uint tag){
+    float base  = gauss2D_tri(uv,           invSize, frameSalt^ (tag+0x11u));
+    float fine  = gauss2D_tri(make_float2(uv.x*2.5f, uv.y*2.5f), invSize, frameSalt^ (tag+0x22u));
+    float coarse= gauss2D_tri(make_float2(uv.x*0.6f, uv.y*0.6f), invSize, frameSalt^ (tag+0x33u));
+    coarse = _clampf(coarse, -2.0f, 2.0f) * 0.5f;
+    float wF=0.25f*(1.0f-PSD_DEFAULT), wM=0.50f, wC=0.10f*PSD_DEFAULT;
+    float v = wF*fine + wM*(base*0.7f + fine*0.3f)*FINE_DETAIL + wC*coarse;
+    float2 d=make_float2(AA_OFF,0.0f), e=make_float2(0.0f,AA_OFF);
+    float ve = gauss2D_tri(make_float2(uv.x+d.x, uv.y+d.y), invSize, frameSalt^(tag+0x55u));
+    float vw = gauss2D_tri(make_float2(uv.x-d.x, uv.y-d.y), invSize, frameSalt^(tag+0x77u));
+    float vn = gauss2D_tri(make_float2(uv.x+e.x, uv.y+e.y), invSize, frameSalt^(tag+0x99u));
+    float vs = gauss2D_tri(make_float2(uv.x-e.x, uv.y-e.y), invSize, frameSalt^(tag+0xBBu));
+    v = (v + ve + vw + vn + vs) * 0.2f;
+    return _tanhf(v*0.7f)*(1.0f/0.7f);
+}
+
+typedef struct { float L00,L10,L11; float L20,L21,L22; } Chol33;
+__DEVICE__ Chol33 cholesky_corr(float rRG,float rRB,float rGB){
+    Chol33 C;
+    float cRG=_clampf(rRG,-0.99f,0.99f), cRB=_clampf(rRB,-0.99f,0.99f), cGB=_clampf(rGB,-0.99f,0.99f);
+    float S00=1.0f, S01=cRG,  S02=cRB, S11=1.0f, S12=cGB, S22=1.0f;
+    float L00v=_sqrtf(_fmaxf(S00,EPS)); float L10v=S01/L00v; float L20v=S02/L00v;
+    float t11=_fmaxf(S11-L10v*L10v,EPS); float L11v=_sqrtf(t11);
+    float L21v=(S12-L20v*L10v)/L11v;
+    float t22=_fmaxf(S22-L20v*L20v-L21v*L21v,EPS); float L22v=_sqrtf(t22);
+    C.L00=L00v; C.L10=L10v; C.L11=L11v; C.L20=L20v; C.L21=L21v; C.L22=L22v; return C;
+}
+
+__DEVICE__ float3 color_grain_from_latents(float2 uv,float invSize,uint frameSalt,Chol33 C){
+    float z1 = latent_psd_field(uv, invSize, frameSalt, 0x10u);
+    float z2 = latent_psd_field(uv, invSize, frameSalt, 0x20u);
+    float z3 = latent_psd_field(uv, invSize, frameSalt, 0x30u);
+    float r = _clampf(C.L00*z1,                        -2.0f, 2.0f)*(1.0f/3.0f);
+    float g = _clampf(C.L10*z1 + C.L11*z2,             -2.0f, 2.0f)*(1.0f/3.0f);
+    float b = _clampf(C.L20*z1 + C.L21*z2 + C.L22*z3,  -2.0f, 2.0f)*(1.0f/3.0f);
+    return make_float3(r,g,b);
+}
+
+// Applies the grain to a DaVinci Intermediate encoded pixel and returns DaVinci Intermediate.
+// frameSalt is computed in transform(), because TIMELINE_FRAME_INDEX is only visible there.
+__DEVICE__ float3 apply_grain(float3 inTF, int p_Width, int p_Height, int p_X, int p_Y, float amtIn, uint frameSalt)
+{
+    float3 inLin = make_float3(di_to_lin(inTF.x), di_to_lin(inTF.y), di_to_lin(inTF.z));
+
+    float minDim=(float)(p_Width<p_Height?p_Width:p_Height);
+    float sizePx=_clampf(GRAIN_SIZE*(minDim*0.001f), 0.5f, 4096.0f);
+    float invSize=1.0f/sizePx;
+
+    float cx=((float)p_Width -1.0f)*0.5f;
+    float cy=((float)p_Height-1.0f)*0.5f;
+    float2 pc = make_float2((float)p_X - cx, (float)p_Y - cy);
+
+    const float cs=0.850650966f, sn=0.525730848f; // cos/sin(0.553574)
+    float2 pr = make_float2(cs*pc.x - sn*pc.y, sn*pc.x + cs*pc.y);
+    float2 uv = make_float2(pr.x*invSize, pr.y*invSize);
+
+    float jgx = (u01(mix32(frameSalt ^ 0x1A2B3C4Du)) - 0.5f) * 0.10f;
+    float jgy = (u01(mix32(frameSalt ^ 0x5E6F7788u)) - 0.5f) * 0.10f;
+    // lattice offset relative to the Grain DCTL's default size of 1.5 (as in the original)
+    float szShift = GRAIN_SIZE - 1.5f;
+    uv = make_float2(uv.x + jgx + szShift*41.0f, uv.y + jgy + szShift*27.0f);
+
+    Chol33 C = cholesky_corr(RGCORR, RBCORR, GBCORR);
+    float3 gColor = color_grain_from_latents(uv, 1.0f, frameSalt, C);
+
+    // Saturation = 0 in the original => grain is the luma of the correlated field on all channels
+    float gGray = luma709(gColor);
+    float3 grain = make_float3(gGray*1.00f, gGray*0.95f, gGray*1.00f);
+
+    float amt=_clampf(amtIn,0.0f,5.0f);
+    float Ylin=_fmaxf(luma709(inLin),0.0f);
+    float Y01=Ylin/(Ylin+0.35f);
+
+    float p1_lo=0.10f, p1_hi=0.40f, p2_lo=0.50f, p2_hi=0.80f;
+    float M_sh=1.0f-sstep(p1_lo,p1_hi,Y01);
+    float M_hi=sstep(p2_lo,p2_hi,Y01);
+    float M_mid=1.0f-_fmaxf(M_sh,M_hi);
+
+    float zoneGain=_clampf(1.0f*M_sh + 1.0f*M_mid + 1.0f*M_hi, 0.5f, 1.5f);
+
+    float expo=_sqrtf(_fmaxf(Ylin,1e-6f));
+    float expoNorm=expo/(expo+0.35f);
+    float k = (amt<=2.5f) ? (0.8f*amt)*expoNorm
+                          : (2.0f + 1.5f*(1.0f-_expf(-(amt-2.5f)/1.2f)))*expoNorm;
+    k*=zoneGain*AMT_GAIN;
+
+    float floorF = 0.8f;   // Dark Granules = 0
+
+    float fx = _fmaxf(floorF, 1.0f + k*grain.x);
+    float fy = _fmaxf(floorF, 1.0f + k*grain.y);
+    float fz = _fmaxf(floorF, 1.0f + k*grain.z);
+
+    float3 outLin = make_float3(_fmaxf(inLin.x*fx,0.0f), _fmaxf(inLin.y*fy,0.0f), _fmaxf(inLin.z*fz,0.0f));
+    return make_float3(lin_to_di(outLin.x), lin_to_di(outLin.y), lin_to_di(outLin.z));
+}
+
+// =====================================================================================
+//  Apply Edge Color Bleed
+//  Samples 24 taps of the ORIGINAL input on a golden-angle spiral that covers a disk of radius
+//  about 0.7% of image height (roughly 7.5 px at 1080p). A neighbour that is clearly brighter than
+//  this pixel donates its chroma (its colour minus its own luminance, in DI log space, so the
+//  donation carries no luminance). Donations are weighted by a smooth radial falloff and
+//  normalised by the total tap weight, so the bleed fades gradually with distance, vanishes in flat
+//  areas (no brightness step => no donor) and scales with how much of the neighbourhood is a
+//  bright, saturated donor. The hue always comes from the source pixels.
+// =====================================================================================
+#define BLEED_STRENGTH 0.60f
+
+__DEVICE__ float3 fetch_src(__TEXTURE__ tr, __TEXTURE__ tg, __TEXTURE__ tb, int x, int y, int W, int H)
+{
+    x = x < 0 ? 0 : (x > W - 1 ? W - 1 : x);
+    y = y < 0 ? 0 : (y > H - 1 ? H - 1 : y);
+    return make_float3(_tex2D(tr, x, y), _tex2D(tg, x, y), _tex2D(tb, x, y));
+}
+
+__DEVICE__ float3 edge_bleed(float3 res, float3 c0, int X, int Y, int W, int H,
+                             __TEXTURE__ tr, __TEXTURE__ tg, __TEXTURE__ tb)
+{
+    float minDim = (float)(W < H ? W : H);
+    float R  = _fmaxf(2.0f, 0.0070f * minDim);
+    float L0 = luma709(c0);
+
+    float accR = 0.0f, accG = 0.0f, accB = 0.0f, wsum = 0.0f;
+
+    for (int t = 0; t < 24; t++)
+    {
+        float f   = ((float)t + 0.5f) * (1.0f / 24.0f);
+        float rad = R * _sqrtf(f);                 // uniform coverage of the disk
+        float ang = 2.3999632f * (float)t;         // golden angle
+        float wr  = 1.0f - f;                      // smooth radial falloff (1 - (rad/R)^2)
+
+        int xi = (int)_floorf((float)X + rad * _cosf(ang) + 0.5f);
+        int yi = (int)_floorf((float)Y + rad * _sinf(ang) + 0.5f);
+        float3 cn = fetch_src(tr, tg, tb, xi, yi, W, H);
+        float  Ln = luma709(cn);
+
+        float gate = sstep(0.03f, 0.15f, Ln - L0);   // only clearly brighter neighbours donate
+        float w = wr * gate;
+        accR += w * (cn.x - Ln);
+        accG += w * (cn.y - Ln);
+        accB += w * (cn.z - Ln);
+        wsum += wr;
+    }
+
+    float k = BLEED_STRENGTH / wsum;
+    float3 d = make_float3(accR * k, accG * k, accB * k);
+
+    // Never push a channel below zero (keeps dark areas from going negative / clipping)
+    if (d.x < 0.0f) d.x = -_fminf(-d.x, 0.9f * _fmaxf(res.x, 0.0f));
+    if (d.y < 0.0f) d.y = -_fminf(-d.y, 0.9f * _fmaxf(res.y, 0.0f));
+    if (d.z < 0.0f) d.z = -_fminf(-d.z, 0.9f * _fmaxf(res.z, 0.0f));
+
+    return make_float3(res.x + d.x, res.y + d.y, res.z + d.z);
+}
+
+// =====================================================================================
+//  Show Curve (display overlay) - same technique as the reference Contrast DCTL:
+//  x = horizontal position (input DI value 0..1, shadows left), y = vertical position (output DI value 0..1,
+//  highlights top). Pixels are blended toward the line colour by their distance to the curve, so only a thin
+//  line is drawn (no background, no panel). The overlay itself is drawn at the end of the main function.
+//  curve_resp() repeats the main processing maths for a neutral grey input x and returns one output channel
+//  (ch 0/1/2 = R/G/B): Silver Infrared amount, tone curve, Highlight Roll-Off, Contrast, Silver / Gold.
+//  Grain and edge bleed are not part of the curve. At Silver Infrared = 0 it is the identity (straight diagonal).
+// =====================================================================================
+#define CURVE_FLIP_Y 1.0f   // 1 = shadows bottom-left, highlights top-right (as in the reference DCTL)
+
+__DEVICE__ float curve_resp(float x, float amt, float roll, float cst, int mode, int ch)
+{
+    if (amt <= 0.0f) return x;
+
+    float L = di_to_lin(x);
+    float mono = 0.60f * L + 0.34f * L + 0.06f * L;   // neutral grey: no warm lift
+
+    float y = silver_curve(lin_to_di(mono));
+    if (roll > 0.0f) y = y + silver_sheen(y) * roll;
+    else if (roll < 0.0f) y = y + silver_sheen_neg(y) * roll;
+    if (cst != 1.0f) y = silver_contrast(y, cst);
+    y = silver_toe(y);   // Silver / Gold
+
+    float tgt = y;
+    if (mode == 1)   // Gold
+    {
+        float  Lg = di_to_lin(y);
+        float3 t  = gold_tint(y);
+        float  tc = (ch == 0) ? t.x : ((ch == 1) ? t.y : t.z);
+        tgt = lin_to_di(Lg * tc);
+    }
+    return x + (tgt - x) * amt;
+}
+
+// coverage (0..1) of one curve at this pixel: core = full-strength half width, edge = soft falloff width (pixels)
+__DEVICE__ float curve_line_alpha(float sy, float yc, float y1, float y0, float e, float W, float H, float core, float edge)
+{
+    float d    = (y1 - y0) / (2.0f * e) * (H / W);            // slope in pixel space
+    float dist = _fabs(sy - yc) * H / _sqrtf(1.0f + d * d);   // pixel distance to the curve
+    return _clampf((core + edge - dist) / edge, 0.0f, 1.0f);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB)
+{
+    // Source pixel (texture access is needed for the edge colour bleed neighbourhood)
+    float p_R = _tex2D(p_TexR, p_X, p_Y);
+    float p_G = _tex2D(p_TexG, p_X, p_Y);
+    float p_B = _tex2D(p_TexB, p_X, p_Y);
+
+    // Exact bypass at zero (when Show Curve is ON the function continues so the overlay can be drawn)
+    if (silver <= 0.0f && !cbShowCurve) return make_float3(p_R, p_G, p_B);
+
+    // To scene-linear (DWG primaries)
+    float r = di_to_lin(p_R);
+    float g = di_to_lin(p_G);
+    float b = di_to_lin(p_B);
+
+    // Infrared-style mix: red-weighted, blue suppressed (sums to 1 so neutrals keep their level)
+    float mono = 0.60f * r + 0.34f * g + 0.06f * b;
+
+    // Subtle waxy lift for warm tones (skin / sand scatter more in IR)
+    float rp = _fmaxf(r, 0.0f), gp = _fmaxf(g, 0.0f), bp = _fmaxf(b, 0.0f);
+    float warm = (rp - bp) / (rp + gp + bp + 1e-4f);
+    mono *= 1.0f + 0.15f * sstep(0.05f, 0.30f, warm);
+
+    // Tone shaping in DI log space
+    float y = silver_curve(lin_to_di(mono));
+
+    // Highlight Roll Off: highlight-only (completely off at 0.0)
+    if (silverTex > 0.0f) y = y + silver_sheen(y) * silverTex;
+    else if (silverTex < 0.0f) y = y + silver_sheen_neg(y) * silverTex;
+
+    // Contrast (completely off at 1.0)
+    if (contrastAmt != 1.0f) y = silver_contrast(y, contrastAmt);
+
+    // Low-end toe lift (Silver and Gold)
+    y = silver_toe(y);
+
+    // Silver (neutral) or gold-metallic colour/tone at the same pipeline stage
+    float3 target = make_float3(y, y, y);
+    if (transcript == 1)   // Gold
+    {
+        float  L = di_to_lin(y);
+        float3 t = gold_tint(y);
+        target = make_float3(lin_to_di(L * t.x), lin_to_di(L * t.y), lin_to_di(L * t.z));
+    }
+
+    // Smooth blend with the original in the same log space
+    float3 res = make_float3(p_R + (target.x - p_R) * silver,
+                             p_G + (target.y - p_G) * silver,
+                             p_B + (target.z - p_B) * silver);
+
+    // Silver Infrared = 0: the image itself stays an exact pass-through (only the Show Curve line may be added below)
+    if (silver <= 0.0f) res = make_float3(p_R, p_G, p_B);
+
+    // Edge Color Bleed: only when enabled (before grain, so the grain is unaffected)
+    if (cbBleed && silver > 0.0f)
+        res = edge_bleed(res, make_float3(p_R, p_G, p_B), p_X, p_Y, p_Width, p_Height, p_TexR, p_TexG, p_TexB);
+
+    // Bleed Checker (diagnostic only): runs the same edge_bleed() on the same input and visualises the difference it
+    // makes. The normal processing above/below is untouched; this only replaces the displayed pixel.
+    // Active only while Apply Edge Color Bleed is ON (otherwise the checkbox has no effect on the image).
+    bool bleedCheckerOn = (cbBleedChecker && cbBleed && silver > 0.0f);
+    if (bleedCheckerOn)
+    {
+        // pre-bleed pipeline result (identical to the 'res' computed before the bleed stage)
+        float3 pre = make_float3(p_R + (target.x - p_R) * silver,
+                                 p_G + (target.y - p_G) * silver,
+                                 p_B + (target.z - p_B) * silver);
+        // bled result: reuse res when Apply Edge Color Bleed already produced it, otherwise run the same function
+        float3 bl = cbBleed ? res
+                            : edge_bleed(pre, make_float3(p_R, p_G, p_B), p_X, p_Y, p_Width, p_Height, p_TexR, p_TexG, p_TexB);
+        float3 dlt = make_float3(bl.x - pre.x, bl.y - pre.y, bl.z - pre.z);
+
+        // Smoothing (display only): the bleed delta is noisy at pixel scale (24 integer-rounded taps), which makes the
+        // highlight jagged. The signed delta is averaged with the delta at the 4 direct neighbours (+-1 px; centre
+        // weight 0.36, neighbours 0.16 each), so the boundary stays where the bleed actually is and only the
+        // pixel-level noise is removed. Runs only while the checker is showing.
+        float3 dsum = make_float3(0.36f * dlt.x, 0.36f * dlt.y, 0.36f * dlt.z);
+        for (int n = 0; n < 4; n++)
+        {
+            int nx = p_X + ((n == 0) ? 1 : ((n == 1) ? -1 : 0));
+            int ny = p_Y + ((n == 2) ? 1 : ((n == 3) ? -1 : 0));
+            float3 cn = fetch_src(p_TexR, p_TexG, p_TexB, nx, ny, p_Width, p_Height);
+            float3 bn = edge_bleed(pre, cn, nx, ny, p_Width, p_Height, p_TexR, p_TexG, p_TexB);
+            dsum.x += 0.16f * (bn.x - pre.x);
+            dsum.y += 0.16f * (bn.y - pre.y);
+            dsum.z += 0.16f * (bn.z - pre.z);
+        }
+
+        float m = _fmaxf(_fabs(dsum.x), _fmaxf(_fabs(dsum.y), _fabs(dsum.z)));
+        const float dark = 0.04f;   // very dark grey (DI), slightly above black
+
+        // Intensity follows the bleed strength continuously: 0 where there is no bleed (stays at the dark background),
+        // rising smoothly to full at strong bleed. No hard cut-off and no brightness floor, so weak bleed is dim and
+        // strong bleed is bright. The ramp start (0.006) keeps the highlight narrow: only the stronger part of the
+        // bleed, near the edge, is clearly visible. Raise it for thinner, lower it for wider.
+        float t  = sstep(0.006f, 0.040f, m);
+        float im = 1.0f / _fmaxf(m, 1e-6f);
+
+        // colour = direction of the colour shift (same hue mapping as before), brightness = bleed strength
+        float3 tint = make_float3(0.5f + 0.5f * dsum.x * im, 0.5f + 0.5f * dsum.y * im, 0.5f + 0.5f * dsum.z * im);
+        // slightly reduced saturation: pull each colour 18% of the way toward its own luminance (hue unchanged)
+        float tl = luma709(tint);
+        tint = make_float3(tl + (tint.x - tl) * 0.82f, tl + (tint.y - tl) * 0.82f, tl + (tint.z - tl) * 0.82f);
+
+        res = make_float3(dark + (1.0f - dark) * tint.x * t,
+                          dark + (1.0f - dark) * tint.y * t,
+                          dark + (1.0f - dark) * tint.z * t);
+    }
+
+    // Integrated grain: only when Texture is ON and Grain Amount > 0 (skipped while the Bleed Checker is showing)
+    if (cbTexture && grainAmount > 0.0f && silver > 0.0f && !bleedCheckerOn)
+    {
+        uint frameSalt = ((((uint)TIMELINE_FRAME_INDEX) * 1013904223u) ^ 0xC52F19DBu);
+        res = apply_grain(res, p_Width, p_Height, p_X, p_Y, grainAmount, frameSalt);
+    }
+
+    // Show Curve: display overlay drawn last, so grain and bleed do not affect the line
+    if (cbShowCurve)
+    {
+        float W  = (float)p_Width;
+        float H  = (float)p_Height;
+        float sx = ((float)p_X + 0.5f) / W;
+        float sy = ((float)p_Y + 0.5f) / H;
+        if (CURVE_FLIP_Y > 0.5f) sy = 1.0f - sy;
+        float e  = 0.5f / W;
+
+        // line weight: thin (reference line) when Texture is OFF; slightly thicker and softer when ON,
+        // growing subtly with Grain Amount. Display only - the grain itself is untouched.
+        float core = 0.5f;
+        float edge = 1.0f;
+        if (cbTexture)
+        {
+            float g01 = _clampf((grainAmount - 0.8f) / 4.2f, 0.0f, 1.0f);
+            core = 1.0f + 0.6f * g01;
+            edge = 1.8f;
+        }
+
+        if (transcript == 1)   // Gold: red, green and blue curves (white where they overlap)
+        {
+            float aR = curve_line_alpha(sy, curve_resp(sx, silver, silverTex, contrastAmt, transcript, 0),
+                                            curve_resp(sx + e, silver, silverTex, contrastAmt, transcript, 0),
+                                            curve_resp(sx - e, silver, silverTex, contrastAmt, transcript, 0), e, W, H, core, edge);
+            float aG = curve_line_alpha(sy, curve_resp(sx, silver, silverTex, contrastAmt, transcript, 1),
+                                            curve_resp(sx + e, silver, silverTex, contrastAmt, transcript, 1),
+                                            curve_resp(sx - e, silver, silverTex, contrastAmt, transcript, 1), e, W, H, core, edge);
+            float aB = curve_line_alpha(sy, curve_resp(sx, silver, silverTex, contrastAmt, transcript, 2),
+                                            curve_resp(sx + e, silver, silverTex, contrastAmt, transcript, 2),
+                                            curve_resp(sx - e, silver, silverTex, contrastAmt, transcript, 2), e, W, H, core, edge);
+            // Additive colour mix from the per-channel coverage at this pixel: where all three curves coincide the
+            // coverages are equal -> white; where only one channel's curve passes -> that channel's pure colour;
+            // partial overlap (e.g. red + green) -> the matching mix. Coverage = the strongest of the three.
+            float aMax = _fmaxf(aR, _fmaxf(aG, aB));
+            if (aMax > 0.0f)
+            {
+                float3 lc = make_float3(aR / aMax, aG / aMax, aB / aMax);
+                res = make_float3(res.x + (lc.x - res.x) * aMax,
+                                  res.y + (lc.y - res.y) * aMax,
+                                  res.z + (lc.z - res.z) * aMax);
+            }
+        }
+        else                   // Silver: one white curve
+        {
+            float a = curve_line_alpha(sy, curve_resp(sx, silver, silverTex, contrastAmt, transcript, 1),
+                                           curve_resp(sx + e, silver, silverTex, contrastAmt, transcript, 1),
+                                           curve_resp(sx - e, silver, silverTex, contrastAmt, transcript, 1), e, W, H, core, edge);
+            res = make_float3(res.x + (1.0f - res.x) * a, res.y + (1.0f - res.y) * a, res.z + (1.0f - res.z) * a);
+        }
+    }
+
+    return res;
+}
